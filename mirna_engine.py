@@ -316,9 +316,9 @@ def evaluate_strict_rules(alignment, rule_set="animal", max_mismatches=4, strict
         if seed_mm > 2:  # Relaxed from 1 → 2 to support seed-imperfect targeting
             passed = False
             reasons.append("Too many seed mismatches/gaps in pos 2-8 ({} found, max 2)".format(seed_mm))
-        if seed_wobbles > 1:
+        if seed_wobbles > 2:  # Relaxed from 1 → 2 (many validated targets have 2 wobble pairs)
             passed = False
-            reasons.append("Too many G:U wobbles in animal seed pos 2-8 ({} found, max 1)".format(seed_wobbles))
+            reasons.append("Too many G:U wobbles in animal seed pos 2-8 ({} found, max 2)".format(seed_wobbles))
             
         # Total mismatches check
         total_errors = mismatches + gaps
