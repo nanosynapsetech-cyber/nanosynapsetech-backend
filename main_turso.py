@@ -68,8 +68,8 @@ TURSO_TOKEN  = os.environ.get("TURSO_AUTH_TOKEN",   "").strip()
 R2_ACCOUNT_ID  = os.environ.get("R2_ACCOUNT_ID",  "").strip()
 R2_ACCESS_KEY  = os.environ.get("R2_ACCESS_KEY",  "").strip()
 R2_SECRET_KEY  = os.environ.get("R2_SECRET_KEY",  "").strip()
-R2_KMER_BUCKET = os.environ.get("R2_KMER_BUCKET", "nanosynapse-kmer")
-R2_SEQ_BUCKET  = os.environ.get("R2_SEQ_BUCKET",  "nanosynapse-seq")
+R2_KMER_BUCKET = os.environ.get("R2_KMER_BUCKET", "nanosynapse-kmer").strip()
+R2_SEQ_BUCKET  = os.environ.get("R2_SEQ_BUCKET",  "nanosynapse-seq").strip()
 
 # Derive Turso HTTP pipeline endpoint
 _TURSO_HTTP_URL     = TURSO_URL.replace("libsql://", "https://") if TURSO_URL else ""
