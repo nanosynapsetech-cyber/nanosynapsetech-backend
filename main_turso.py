@@ -429,12 +429,7 @@ def run_database_search(mirna_id: str, mirna_seq: str,
             mfe_threshold=mfe_threshold,
         )
 
-        if engine_result.get("Status") != "PASS":
-            return None
-        if engine_result.get("Similarity_Percent", 0) < 55.0:
-            return None
-
-        # Return intermediate result — metadata fetched later in batch
+        # Return all results — PASS/FAIL visible to user, sorted by confidence
         return {"gene_id": gene_id, "prediction": engine_result}
 
     # Submit all genes to thread pool; collect until we have 15 matches
@@ -451,16 +446,17 @@ def run_database_search(mirna_id: str, mirna_seq: str,
             if hit is not None:
                 deep += 1
                 raw_results.append(hit)
-                logger.info(
-                    "  ✅ MATCH: %s | Confidence: %s | MFE: %s kcal/mol",
-                    future_map[future],
-                    hit["prediction"].get("Confidence_Score", "?"),
-                    hit["prediction"].get("MFE_kcal_mol", "?"),
-                )
-                if len(raw_results) >= MAX_TARGETS:
-                    for f in future_map:
-                        f.cancel()
-                    break
+                if hit["prediction"].get("Status") == "PASS":
+                    logger.info(
+                        "  ✅ MATCH: %s | Confidence: %s | MFE: %s kcal/mol",
+                        future_map[future],
+                        hit["prediction"].get("Confidence_Score", "?"),
+                        hit["prediction"].get("MFE_kcal_mol", "?"),
+                    )
+
+    # Sort all results by confidence (best first), take top MAX_TARGETS
+    raw_results.sort(key=lambda x: x["prediction"].get("Confidence_Score", 0), reverse=True)
+    raw_results = raw_results[:MAX_TARGETS]
 
     # ── Step 4: Turso metadata batch fetch (only for matched genes) ─────────
     matched_ids = [h["gene_id"] for h in raw_results]
