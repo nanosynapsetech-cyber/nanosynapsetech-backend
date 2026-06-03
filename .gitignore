@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.db
+*.sqlite
+*.fna
+*.sql
+*.sql~
+kmer_output/
+seq_output/
+turso-cli_Linux_x86_64/
+r2_upload_log.json
