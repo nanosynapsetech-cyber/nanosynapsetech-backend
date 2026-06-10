@@ -37,103 +37,81 @@ DEFAULT_MFE_THRESHOLD_PLANT  = -18.0  # Tightened to reduce false positives (was
 
 # ─── 1. ALIGNMENT PARSING ─────────────────────────────────────────────────────
 
-def parse_alignment(mirna_seq, target_seq, structure, duplex_i, duplex_j):
+def parse_alignment(mirna_aligned, target_aligned, structure):
     """
-    Correctly parse ViennaRNA dot-bracket structure and extract exact alignment columns.
-    Maps anti-parallel strands (miRNA 5'->3' and target 3'->5') including bulges/gaps.
+    Parse ViennaRNA dot-bracket structure into alignment columns.
     
-    mirna_seq: 5' to 3' miRNA sequence
-    target_seq: 5' to 3' full target sequence
-    structure: dot-bracket string from duplexfold (e.g. '(((...)))&(((...)))')
-    duplex_i: 1-based end index in miRNA
-    duplex_j: 1-based start index in target
+    mirna_aligned:  the exact miRNA substring that aligns (length == len(s1))
+    target_aligned: the exact target substring that aligns (length == len(s2))
+    structure:      dot-bracket string e.g. '(((...)))&(((....)))'
+    
+    Both sequences MUST be pre-sliced to match the dot-bracket lengths exactly.
+    Anti-parallel: miRNA 5'->3' pairs with target 3'->5'.
     """
     if not structure or '&' not in structure:
         return []
-        
+
     s1, s2 = structure.split('&', 1)
-    
-    # Extract aligned portion of miRNA
-    mirna_len = len(s1)
-    mirna_start = max(0, duplex_i - mirna_len)
-    mirna_aligned = mirna_seq[mirna_start:duplex_i]
-    
-    # Extract aligned portion of target
-    target_len = len(s2)
-    target_start = max(0, duplex_j - 1)
-    target_end = min(len(target_seq), duplex_j - 1 + target_len)
-    target_aligned = target_seq[target_start:target_end]
-    
-    # Find base pairing indices (representing Watson-Crick and Wobble pairs)
-    s1_pairs = [idx for idx, char in enumerate(s1) if char == '(']
-    s2_pairs = [idx for idx, char in enumerate(s2) if char == ')']
-    
-    # Reverse target pairing since the hybrid binds anti-parallel
-    s2_pairs_reversed = list(reversed(s2_pairs))
-    
-    pairing_map = {}
-    for k in range(min(len(s1_pairs), len(s2_pairs))):
-        pairing_map[s1_pairs[k]] = s2_pairs_reversed[k]
-        
+
+    # Truncate to dot-bracket length (safety clamp)
+    mirna_aligned  = mirna_aligned[:len(s1)]
+    target_aligned = target_aligned[:len(s2)]
+
+    # Find paired positions in each strand
+    s1_pairs = [idx for idx, ch in enumerate(s1) if ch == '(']
+    s2_pairs = [idx for idx, ch in enumerate(s2) if ch == ')']
+
+    # Anti-parallel: first pair in miRNA pairs with LAST pair in target
+    s2_pairs_rev = list(reversed(s2_pairs))
+    pairing_map  = {}
+    for k in range(min(len(s1_pairs), len(s2_pairs_rev))):
+        pairing_map[s1_pairs[k]] = s2_pairs_rev[k]
+
     columns = []
     target_placed = [False] * len(target_aligned)
-    
-    # Loop over miRNA position i from 5' to 3'
+
     for i in range(len(s1)):
-        char1 = s1[i]
-        
-        if char1 == '(':
-            target_idx = pairing_map[i]
-            
-            # Place any target bulges before this paired base.
-            # Antiparallel check: from the right (end) of target_aligned down to target_idx + 1.
-            for j in range(len(target_aligned) - 1, target_idx, -1):
-                if j < len(target_placed) and not target_placed[j]:
-                    columns.append({
-                        "m": "-",
-                        "t": target_aligned[j],
-                        "match": False,
-                        "bulge": "target"
-                    })
+        ch = s1[i]
+
+        if ch == '(':
+            t_idx = pairing_map.get(i)
+            if t_idx is None:
+                continue
+
+            # Insert any unplaced target bulges that come BEFORE this paired base
+            # (anti-parallel: higher indices are 5' of target, come earlier in read)
+            for j in range(len(target_aligned) - 1, t_idx, -1):
+                if not target_placed[j]:
+                    columns.append({"m": "-", "t": target_aligned[j],
+                                    "match": False, "bulge": "target"})
                     target_placed[j] = True
-            
-            # Place the paired column
-            if i < len(mirna_aligned) and target_idx < len(target_aligned):
+
+            # Insert the paired column
+            if i < len(mirna_aligned) and t_idx < len(target_aligned):
                 m_base = mirna_aligned[i]
-                t_base = target_aligned[target_idx]
-                pair = frozenset({m_base, t_base})
-                is_wc = pair in WATSON_CRICK
-                is_wob = pair == WOBBLE
-                
+                t_base = target_aligned[t_idx]
+                pair   = frozenset({m_base, t_base})
                 columns.append({
-                    "m": m_base,
-                    "t": t_base,
-                    "match": is_wc or is_wob
+                    "m":     m_base,
+                    "t":     t_base,
+                    "match": pair in WATSON_CRICK or pair == WOBBLE,
                 })
-                target_placed[target_idx] = True
+                target_placed[t_idx] = True
         else:
-            # miRNA bulge (gap in target)
+            # miRNA bulge (unpaired miRNA base, gap in target)
             if i < len(mirna_aligned):
-                columns.append({
-                    "m": mirna_aligned[i],
-                    "t": "-",
-                    "match": False,
-                    "bulge": "mirna"
-                })
-                
-    # Place any remaining target bulges at the very 5' end of the target
-    # (which corresponds to the 3' end of the miRNA)
+                columns.append({"m": mirna_aligned[i], "t": "-",
+                                "match": False, "bulge": "mirna"})
+
+    # Insert any remaining unplaced target bases at the 3' end
     for j in range(len(target_aligned) - 1, -1, -1):
-        if j < len(target_placed) and not target_placed[j]:
-            columns.append({
-                "m": "-",
-                "t": target_aligned[j],
-                "match": False,
-                "bulge": "target"
-            })
+        if not target_placed[j]:
+            columns.append({"m": "-", "t": target_aligned[j],
+                            "match": False, "bulge": "target"})
             target_placed[j] = True
-            
+
     return columns
+
 
 # ─── 2. WEIGHTED PENALTY SCORE ────────────────────────────────────────────────
 
@@ -592,7 +570,21 @@ def find_targets(
     matched = target_seq[slice_start:slice_end]
     
     # Step 2: Parse exact alignment BasePair[] columns for frontend
-    alignment = parse_alignment(mirna_seq, target_seq, structure, duplex.i, duplex.j)
+    # Pre-slice EXACTLY the aligned portions using dot-bracket lengths
+    s1_len = len(s1)  # dot-bracket length for miRNA strand
+    s2_len = len(s2)  # dot-bracket length for target strand
+
+    # miRNA: duplex.i is 1-based end position → slice [end-s1_len : end]
+    mirna_end   = min(duplex.i, len(mirna_seq))
+    mirna_start = max(0, mirna_end - s1_len)
+    mirna_aln   = mirna_seq[mirna_start:mirna_end]
+
+    # Target: duplex.j is 1-based start position → slice [j-1 : j-1+s2_len]
+    target_aln_start = max(0, duplex.j - 1)
+    target_aln_end   = min(len(target_seq), target_aln_start + s2_len)
+    target_aln       = target_seq[target_aln_start:target_aln_end]
+
+    alignment = parse_alignment(mirna_aln, target_aln, structure)
     
     # Step 3: Evaluate strict rules and weighted penalty score along alignment columns
     passed, reasons, mm_count, gaps, penalty = evaluate_strict_rules(
