@@ -209,7 +209,8 @@ def run_database_search(mirna_id: str, mirna_seq: str,
             "JOIN genes_fts f ON g.rowid = f.rowid "
             "WHERE f.Sequence MATCH ? "
             "AND (g.Biotype = 'transcript' OR g.Biotype LIKE '%mrna%' "
-            "     OR g.Biotype LIKE '%cdna%')"
+            "     OR g.Biotype LIKE '%cdna%') "
+            "AND NOT (g.Gene_ID LIKE 'XM_%' OR g.Gene_ID LIKE 'XR_%' OR g.Description LIKE 'PREDICTED%')"
         )
         cursor.execute(query, (f'"{seed_rc}"',))
         columns = [col[0] for col in cursor.description]
