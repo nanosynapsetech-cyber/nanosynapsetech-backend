@@ -88,8 +88,15 @@ _MAX_CACHE = 100   # Keep last 100 unique queries
 
 
 def _cache_key(mirna_id: str, mirna_seq: str,
-               mfe_threshold: float, max_mismatches: int, rule_set: str) -> str:
-    raw = f"{mirna_id}:{mirna_seq}:{mfe_threshold}:{max_mismatches}:{rule_set}"
+               mfe_threshold: float, max_mismatches: int, rule_set: str,
+               rule_max_mismatch: bool = True, rule_cleavage_site: bool = True,
+               rule_seed_mismatch: bool = True, rule_consecutive: bool = True,
+               rule_seed_mfe: bool = False, seed_mfe_threshold: float = -20.0) -> str:
+    raw = (
+        f"{mirna_id}:{mirna_seq}:{mfe_threshold}:{max_mismatches}:{rule_set}"
+        f":{rule_max_mismatch}:{rule_cleavage_site}:{rule_seed_mismatch}"
+        f":{rule_consecutive}:{rule_seed_mfe}:{seed_mfe_threshold}"
+    )
     return hashlib.md5(raw.encode()).hexdigest()
 
 
@@ -107,24 +114,38 @@ def _cache_set(key: str, value: list) -> None:
 # ─── MODELS ───────────────────────────────────────────────────────────────────
 
 class AnalysisRequest(BaseModel):
-    mirna_fasta:     str
-    target_fasta:    str   = ""
-    search_mode:     str   = "manual"
-    mfe_threshold:   float = -17.0
-    max_mismatches:  int   = 4
-    strict_cleavage: bool  = True
-    rule_set:        str   = "animal"
-    organism:        str   = DEFAULT_ORGANISM   # organism_id from ORGANISM_DATABASES
+    mirna_fasta:        str
+    target_fasta:       str   = ""
+    search_mode:        str   = "manual"
+    mfe_threshold:      float = -17.0
+    max_mismatches:     int   = 4
+    strict_cleavage:    bool  = True
+    rule_set:           str   = "animal"
+    organism:           str   = DEFAULT_ORGANISM
+    # v3.0: Granüler kural kontroller (her biri bağımsız toggle)
+    rule_max_mismatch:  bool  = True    # Kural i:   Global max mismatch
+    rule_cleavage_site: bool  = True    # Kural ii:  Pos 10-11 koruması
+    rule_seed_mismatch: bool  = True    # Kural iii: Pos 1-9 max 1 mismatch
+    rule_consecutive:   bool  = True    # Kural iv:  Ardışık 2+ yasak
+    rule_seed_mfe:      bool  = False   # Kural v:   Seed region MFE (default kapalı)
+    seed_mfe_threshold: float = -20.0   # Kural v eşiği (kcal/mol)
 
 
 class BatchRequest(BaseModel):
-    mirnas:          list[str]   # List of FASTA strings
-    search_mode:     str   = "automatic"
-    mfe_threshold:   float = -17.0
-    max_mismatches:  int   = 4
-    strict_cleavage: bool  = True
-    rule_set:        str   = "animal"
-    organism:        str   = DEFAULT_ORGANISM   # organism_id from ORGANISM_DATABASES
+    mirnas:             list[str]
+    search_mode:        str   = "automatic"
+    mfe_threshold:      float = -17.0
+    max_mismatches:     int   = 4
+    strict_cleavage:    bool  = True
+    rule_set:           str   = "animal"
+    organism:           str   = DEFAULT_ORGANISM
+    # v3.0: Granüler kural kontroller
+    rule_max_mismatch:  bool  = True
+    rule_cleavage_site: bool  = True
+    rule_seed_mismatch: bool  = True
+    rule_consecutive:   bool  = True
+    rule_seed_mfe:      bool  = False
+    seed_mfe_threshold: float = -20.0
 
 
 # ─── CORE DATABASE SEARCH ─────────────────────────────────────────────────────
@@ -133,7 +154,14 @@ def run_database_search(mirna_id: str, mirna_seq: str,
                          mfe_threshold: float, max_mismatches: int,
                          strict_cleavage: bool,
                          rule_set: str = "animal",
-                         organism: str = DEFAULT_ORGANISM) -> list:
+                         organism: str = DEFAULT_ORGANISM,
+                         # v3.0: Granüler kural parametreleri
+                         rule_max_mismatch: bool = True,
+                         rule_cleavage_site: bool = True,
+                         rule_seed_mismatch: bool = True,
+                         rule_consecutive: bool = True,
+                         rule_seed_mfe: bool = False,
+                         seed_mfe_threshold: float = -20.0) -> list:
     """
     Seed-filter → ViennaRNA thermodynamic scan → top-15 results.
     Results are cached by query hash.
@@ -151,9 +179,11 @@ def run_database_search(mirna_id: str, mirna_seq: str,
         logger.error(f"Organism DB not found: {db_path}")
         return []
 
-    # Auto-override: animal mode does NOT require perfect cleavage site (pos 10-11)
-    effective_cleavage = strict_cleavage if rule_set == "plant" else False
-    key = _cache_key(mirna_id, mirna_seq, mfe_threshold, max_mismatches, rule_set) + f":{organism}"
+    # v3.0: strict_cleavage artık kullanıcı tercihine bırakıldı (animal override kaldırıldı)
+    effective_cleavage = strict_cleavage
+    key = _cache_key(mirna_id, mirna_seq, mfe_threshold, max_mismatches, rule_set,
+                     rule_max_mismatch, rule_cleavage_site, rule_seed_mismatch,
+                     rule_consecutive, rule_seed_mfe, seed_mfe_threshold) + f":{organism}"
     cached = _cache_get(key)
     if cached is not None:
         logger.info(f"✨ Cache HIT: {mirna_id} [{org_display}]")
@@ -213,11 +243,33 @@ def run_database_search(mirna_id: str, mirna_seq: str,
                                           rule_set=rule_set,
                                           max_mismatches=max_mismatches,
                                           strict_cleavage=effective_cleavage,
-                                          mfe_threshold=mfe_threshold)
+                                          mfe_threshold=mfe_threshold,
+                                          rule_max_mismatch=rule_max_mismatch,
+                                          rule_cleavage_site=rule_cleavage_site,
+                                          rule_seed_mismatch=rule_seed_mismatch,
+                                          rule_consecutive=rule_consecutive,
+                                          # Kural v: önce PASS'leri bul, sonra seed MFE uygula
+                                          rule_seed_mfe=False,
+                                          seed_mfe_threshold=seed_mfe_threshold)
 
             if engine_result["Status"] == "PASS":
                 sim = engine_result.get("Similarity_Percent", 0)
                 if sim >= 55.0:
+                    # Kural v: PASS + similarity OK ise seed MFE post-filter uygula
+                    if rule_seed_mfe:
+                        from mirna_engine import calculate_region_mfe
+                        bind_pos = int(engine_result["Binding_Position"].split("-")[0])
+                        s_mfe_2_7, s_mfe_8_13 = calculate_region_mfe(
+                            mirna_seq, short_target, bind_pos
+                        )
+                        engine_result["Seed_MFE_2_7"]  = s_mfe_2_7
+                        engine_result["Seed_MFE_8_13"] = s_mfe_8_13
+                        if not (s_mfe_2_7 <= seed_mfe_threshold or s_mfe_8_13 <= seed_mfe_threshold):
+                            logger.info(
+                                f"   Kural v FAIL: {target_id} seed MFE 2-7={s_mfe_2_7}, 8-13={s_mfe_8_13}"
+                            )
+                            continue  # Bu geni sonuca ekleme
+
                     results.append({
                         "prediction": engine_result,
                         "biological_context": {
@@ -283,18 +335,31 @@ async def run_analysis(request: AnalysisRequest):
                 request.strict_cleavage,
                 request.rule_set,
                 request.organism,
+                request.rule_max_mismatch,
+                request.rule_cleavage_site,
+                request.rule_seed_mismatch,
+                request.rule_consecutive,
+                request.rule_seed_mfe,
+                request.seed_mfe_threshold,
             )
         else:
             # Manual: compute p-value since it's just 1 target
             target_id, target_seq = parse_fasta(request.target_fasta)
-            effective_cleavage = request.strict_cleavage if request.rule_set == "plant" else False
+            # v3.0: kullanıcı tercihi geçerli (animal override yok)
+            effective_cleavage = request.strict_cleavage
             engine_result = find_targets(
                 mirna_id, mirna_seq, target_id, target_seq,
                 compute_pvalue=True,
                 rule_set=request.rule_set,
                 max_mismatches=request.max_mismatches,
                 strict_cleavage=effective_cleavage,
-                mfe_threshold=request.mfe_threshold
+                mfe_threshold=request.mfe_threshold,
+                rule_max_mismatch=request.rule_max_mismatch,
+                rule_cleavage_site=request.rule_cleavage_site,
+                rule_seed_mismatch=request.rule_seed_mismatch,
+                rule_consecutive=request.rule_consecutive,
+                rule_seed_mfe=request.rule_seed_mfe,
+                seed_mfe_threshold=request.seed_mfe_threshold,
             )
             results = [{
                 "prediction": engine_result,
@@ -339,6 +404,12 @@ async def batch_analysis(request: BatchRequest):
                 request.strict_cleavage,
                 request.rule_set,
                 request.organism,
+                request.rule_max_mismatch,
+                request.rule_cleavage_site,
+                request.rule_seed_mismatch,
+                request.rule_consecutive,
+                request.rule_seed_mfe,
+                request.seed_mfe_threshold,
             ))
 
         all_results = await asyncio.gather(*tasks, return_exceptions=True)

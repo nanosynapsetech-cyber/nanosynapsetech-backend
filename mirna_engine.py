@@ -1,14 +1,13 @@
 # -*- coding: utf-8 -*-
-# backend/mirna_engine.py -- NanoSynapse Engine v2.2 (Calibrated Biological Rules)
-# Improvements in v2.2 (calibration):
-#   [1] Animal MFE threshold relaxed: -20.0 → -17.0 kcal/mol (reduces false negatives)
-#   [2] Plant MFE threshold tightened: -15.0 → -18.0 kcal/mol (reduces false positives)
-#   [3] Plant penalty threshold: 4.5 → 4.0 (aligns with psRNATarget standard)
-#   [4] Animal penalty threshold: 5.0 → 4.0 (aligns with Miranda standard)
-#   [5] Consecutive mismatch/gap limit: >2 → >1 (max 2 consecutive allowed)
-#   [6] Animal seed max mismatch: 1 → 2 (supports seed-imperfect targeting)
-#   [7] p-value permutation n: 50 → 200 (statistical reliability improvement)
-#   [8] Confidence score weights updated: penalty 25→30%, p-value 5→10%, GC 10→5%
+# backend/mirna_engine.py -- NanoSynapse Engine v3.0 (User-Toggleable Biological Rules)
+# v3.0 changes:
+#   [1] 5 biological rules are now individually user-toggleable via parameters
+#   [2] Rule iii (pos 1-9 max 1 mismatch) — newly implemented (was missing)
+#   [3] Rule iv (consecutive 2+ ban) — reset logic bug fixed
+#   [4] Rule v  (seed region MFE ≤ threshold) — calculate_region_mfe() added
+#   [5] evaluate_strict_rules() signature extended with 5 rule flags
+#   [6] find_targets() signature extended with rule flags + seed_mfe_threshold
+#   [7] Animal mode cleavage override removed — now fully user-controlled
 
 import random
 import RNA
@@ -242,97 +241,137 @@ def calculate_penalty_score(alignment, rule_set="animal"):
 
 # ─── 3. STRICT VALIDATION RULES ───────────────────────────────────────────────
 
-def evaluate_strict_rules(alignment, rule_set="animal", max_mismatches=4, strict_cleavage=True):
+def evaluate_strict_rules(
+    alignment,
+    rule_set="animal",
+    max_mismatches=4,
+    strict_cleavage=True,
+    # ── Granüler kural toggleları (v3.0) ──────────────────────────────────────
+    rule_max_mismatch=True,   # Kural i:   Global max mismatch kontrolü
+    rule_cleavage_site=True,  # Kural ii:  Pos 10-11 cleavage koruması
+    rule_seed_mismatch=True,  # Kural iii: Pos 1-9 max 1 mismatch
+    rule_consecutive=True,    # Kural iv:  Ardışık 2+ mismatch/gap yasak
+):
     """
     Evaluates strict alignment validation rules.
+    Each of the 5 biological rules can be individually toggled.
     Returns (passed, reasons, mismatches, gaps, penalty)
+    
+    Rules:
+      i.   rule_max_mismatch  — Total mismatches+gaps <= max_mismatches
+      ii.  rule_cleavage_site — No mismatch at pos 10-11 (5' end)
+      iii. rule_seed_mismatch — Max 1 mismatch in pos 1-9
+      iv.  rule_consecutive   — No more than 2 consecutive mismatches/gaps
+      (v handled in find_targets via calculate_region_mfe)
     """
     passed = True
     reasons = []
     mismatches = 0
     gaps = 0
     consecutive = 0
+    max_consecutive_seen = 0
     seed_mm = 0
     seed_wobbles = 0
-    
-    # Track miRNA positions
+    early_seed_mm = 0   # Kural iii: pos 1-9 mismatch sayacı
+
     mirna_pos = 0
-    
+
     for col in alignment:
         m = col["m"]
         t = col["t"]
-        
-        # Check gaps
+
+        # ── GAP sütunu ──────────────────────────────────────────────────────────
         if m == "-" or t == "-":
             gaps += 1
             consecutive += 1
-            if m != "-":
+            if consecutive > max_consecutive_seen:
+                max_consecutive_seen = consecutive
+
+            if m != "-":  # miRNA gap (bulge in target)
                 mirna_pos += 1
-                # Seed check for miRNA positions (animal: 2-8, plant: 2-13)
                 if rule_set == "animal" and (2 <= mirna_pos <= 8):
                     seed_mm += 1
                 elif rule_set == "plant" and (2 <= mirna_pos <= 13):
                     seed_mm += 1
-                    
-            if consecutive > 1:  # Max 2 consecutive allowed (was >2)
-                passed = False
-                reasons.append("More than 2 consecutive mismatches or gaps")
+                # Kural iii: pos 1-9 gap sayılır
+                if 1 <= mirna_pos <= 9:
+                    early_seed_mm += 1
             continue
-            
+
+        # ── PAIRED sütunu ───────────────────────────────────────────────────────
         mirna_pos += 1
-        consecutive = 0
         pair = frozenset({m, t})
         is_match = pair in ALL_PAIRS
         is_wobble = pair == WOBBLE
-        
-        if not is_match:
-            mismatches += 1
-            consecutive += 1
-            
-            # Check seed region
-            if rule_set == "animal" and (2 <= mirna_pos <= 8):
-                seed_mm += 1
-            elif rule_set == "plant" and (2 <= mirna_pos <= 13):
-                seed_mm += 1
-                
-            # Cleavage site check (pos 10-11)
-            if strict_cleavage and (10 <= mirna_pos <= 11):
-                passed = False
-                reasons.append("Mismatch at cleavage site (pos {})".format(mirna_pos))
-                
-            if consecutive > 1:  # Max 2 consecutive allowed (was >2)
-                passed = False
-                reasons.append("More than 2 consecutive mismatches or gaps")
-        else:
+
+        if is_match:
+            # Düzgün çift: consecutive sıfırla
+            consecutive = 0
             if is_wobble:
                 if rule_set == "animal" and (2 <= mirna_pos <= 8):
                     seed_wobbles += 1
                 elif rule_set == "plant" and (2 <= mirna_pos <= 13):
                     seed_wobbles += 1
-                    
-    # Rule validation thresholds
+        else:
+            # Mismatch
+            mismatches += 1
+            consecutive += 1
+            if consecutive > max_consecutive_seen:
+                max_consecutive_seen = consecutive
+
+            # Seed region sayacı
+            if rule_set == "animal" and (2 <= mirna_pos <= 8):
+                seed_mm += 1
+            elif rule_set == "plant" and (2 <= mirna_pos <= 13):
+                seed_mm += 1
+
+            # Kural iii: pos 1-9 mismatch sayacı
+            if 1 <= mirna_pos <= 9:
+                early_seed_mm += 1
+
+            # Kural ii: Cleavage site koruması (pos 10-11)
+            if rule_cleavage_site and strict_cleavage and (10 <= mirna_pos <= 11):
+                passed = False
+                reasons.append("Kural ii: Mismatch at cleavage site pos {} (pos 10-11 protected)".format(mirna_pos))
+
+    # ── Kural iv: Ardışık mismatch/gap kontrolü ──────────────────────────────
+    if rule_consecutive and max_consecutive_seen > 2:
+        passed = False
+        reasons.append(
+            "Kural iv: {} consecutive mismatches/gaps found (max 2 allowed)".format(max_consecutive_seen)
+        )
+
+    # ── Kural iii: Pos 1-9 max 1 mismatch ───────────────────────────────────
+    if rule_seed_mismatch and early_seed_mm > 1:
+        passed = False
+        reasons.append(
+            "Kural iii: {} mismatches/gaps in pos 1-9 (max 1 allowed)".format(early_seed_mm)
+        )
+
+    # ── Rule-set spesifik seed kontrolleri ───────────────────────────────────
     if rule_set == "animal":
-        # Animal rules: Seed region 2-8: max 2 mismatches (seed-imperfect targeting supported)
-        if seed_mm > 2:  # Relaxed from 1 → 2 to support seed-imperfect targeting
+        if seed_mm > 2:
             passed = False
             reasons.append("Too many seed mismatches/gaps in pos 2-8 ({} found, max 2)".format(seed_mm))
-        if seed_wobbles > 2:  # Relaxed from 1 → 2 (many validated targets have 2 wobble pairs)
+        if seed_wobbles > 2:
             passed = False
             reasons.append("Too many G:U wobbles in animal seed pos 2-8 ({} found, max 2)".format(seed_wobbles))
-            
-        # Total mismatches check
-        total_errors = mismatches + gaps
-        if total_errors > max_mismatches:
-            passed = False
-            reasons.append("Total mismatches & gaps ({}) exceeds limit {}".format(total_errors, max_mismatches))
-            
+
+        # Kural i: Global total mismatch kontrolü
+        if rule_max_mismatch:
+            total_errors = mismatches + gaps
+            if total_errors > max_mismatches:
+                passed = False
+                reasons.append(
+                    "Kural i: Total mismatches & gaps ({}) exceeds limit {}".format(total_errors, max_mismatches)
+                )
     else:
-        # Plant rules: Seed region 2-13: max 2 mismatches (excluding G:U wobbles), no consecutive mismatches in seed
+        # Plant: seed 2-13
         if seed_mm > 2:
             passed = False
             reasons.append("Too many seed mismatches/gaps in pos 2-13 ({} found, max 2)".format(seed_mm))
-            
-        # Check for consecutive mismatches in seed region
+
+        # Plant seed'de ardışık mismatch
         consec_seed_mm = 0
         mirna_pos_temp = 0
         for col in alignment:
@@ -345,19 +384,61 @@ def evaluate_strict_rules(alignment, rule_set="animal", max_mismatches=4, strict
                     if consec_seed_mm > 1:
                         passed = False
                         reasons.append("Consecutive mismatches/gaps in seed region not allowed")
+                        break
                 else:
                     consec_seed_mm = 0
-                    
-    # Expectation penalty score evaluation
+
+        # Kural i: Global total mismatch kontrolü (plant)
+        if rule_max_mismatch:
+            total_errors = mismatches + gaps
+            if total_errors > max_mismatches:
+                passed = False
+                reasons.append(
+                    "Kural i: Total mismatches & gaps ({}) exceeds limit {}".format(total_errors, max_mismatches)
+                )
+
+    # ── Penalty score değerlendirmesi ────────────────────────────────────────
     penalty = calculate_penalty_score(alignment, rule_set)
     max_penalty = DEFAULT_MAX_PENALTY_PLANT if rule_set == "plant" else DEFAULT_MAX_PENALTY_ANIMAL
     if penalty > max_penalty:
         passed = False
         reasons.append("Penalty score {} exceeds threshold {}".format(penalty, max_penalty))
-        
+
     return passed, list(set(reasons)), mismatches, gaps, penalty
 
-# ─── 4. TARGET SITE ACCESSIBILITY ─────────────────────────────────────────────
+# ─── 4. SEED REGION MFE (Kural v) ────────────────────────────────────────────
+
+def calculate_region_mfe(mirna_seq, target_seq, bind_start):
+    """
+    Kural v: miRNA 5' ucundan pos 2-7 ve/veya pos 8-13 için bölge-spesifik MFE.
+    Her iki seed penceresi için ayrı duplexfold hesaplar.
+    En iyi (en negatif) MFE değerini döndürür.
+    
+    mirna_seq:  tam miRNA dizisi (5'→3')
+    target_seq: hedef sekans
+    bind_start: 1-tabanlı bağlanma başlangıcı
+    """
+    try:
+        seed_2_7  = mirna_seq[1:7]    # 0-indexed → pos 2-7
+        seed_8_13 = mirna_seq[7:13]   # 0-indexed → pos 8-13
+
+        # Hedef üzerinde bağlanma bölgesi etrafında pencere
+        ctx_start = max(0, bind_start - 5)
+        ctx_end   = min(len(target_seq), bind_start + 20)
+        window    = target_seq[ctx_start:ctx_end]
+
+        if not window or len(window) < 6:
+            return 0.0, 0.0
+
+        mfe_2_7  = RNA.duplexfold(seed_2_7,  window).energy if len(seed_2_7)  >= 4 else 0.0
+        mfe_8_13 = RNA.duplexfold(seed_8_13, window).energy if len(seed_8_13) >= 4 else 0.0
+
+        return round(mfe_2_7, 2), round(mfe_8_13, 2)
+    except Exception:
+        return 0.0, 0.0
+
+
+# ─── 5. TARGET SITE ACCESSIBILITY ─────────────────────────────────────────────
 
 def estimate_accessibility(target_seq, bind_start, mirna_len):
     """
@@ -474,7 +555,21 @@ def calculate_confidence(mfe, penalty, gc, accessibility, p_value, rule_set="ani
 
 # ─── MAIN PREDICTION FUNCTION ─────────────────────────────────────────────────
 
-def find_targets(mirna_id, mirna_seq, target_id, target_seq, compute_pvalue=False, rule_set="animal", max_mismatches=4, strict_cleavage=True, mfe_threshold=None):
+def find_targets(
+    mirna_id, mirna_seq, target_id, target_seq,
+    compute_pvalue=False,
+    rule_set="animal",
+    max_mismatches=4,
+    strict_cleavage=True,
+    mfe_threshold=None,
+    # ── v3.0: Granüler kural toggleları ──────────────────────────────────────
+    rule_max_mismatch=True,   # Kural i
+    rule_cleavage_site=True,  # Kural ii
+    rule_seed_mismatch=True,  # Kural iii
+    rule_consecutive=True,    # Kural iv
+    rule_seed_mfe=False,      # Kural v (default kapalı, ek hesaplama)
+    seed_mfe_threshold=-20.0, # Kural v eşiği
+):
     """
     Full miRNA-target prediction pipeline supporting plant and animal rule sets.
     Returns a rich result dictionary consumed by FastAPI and Next.js frontend.
@@ -501,7 +596,11 @@ def find_targets(mirna_id, mirna_seq, target_id, target_seq, compute_pvalue=Fals
     
     # Step 3: Evaluate strict rules and weighted penalty score along alignment columns
     passed, reasons, mm_count, gaps, penalty = evaluate_strict_rules(
-        alignment, rule_set, max_mismatches, strict_cleavage
+        alignment, rule_set, max_mismatches, strict_cleavage,
+        rule_max_mismatch=rule_max_mismatch,
+        rule_cleavage_site=rule_cleavage_site,
+        rule_seed_mismatch=rule_seed_mismatch,
+        rule_consecutive=rule_consecutive,
     )
     
     # Step 4: Check thermodynamic threshold
@@ -518,7 +617,20 @@ def find_targets(mirna_id, mirna_seq, target_id, target_seq, compute_pvalue=Fals
     
     # Step 7: p-value (only for manual alignments due to db scan speeds)
     p_value = calculate_pvalue(mirna_seq, target_seq, mfe) if compute_pvalue else 1.0
-    
+
+    # Step 7b: Kural v — Seed region MFE (pos 2-7 ve 8-13) — sadece gerektiğinde
+    seed_mfe_2_7  = 0.0
+    seed_mfe_8_13 = 0.0
+    if rule_seed_mfe:
+        seed_mfe_2_7, seed_mfe_8_13 = calculate_region_mfe(mirna_seq, target_seq, bind_start)
+        if not (seed_mfe_2_7 <= seed_mfe_threshold or seed_mfe_8_13 <= seed_mfe_threshold):
+            passed = False
+            reasons.append(
+                "Kural v: Seed MFE insufficient — pos2-7: {} kcal/mol, pos8-13: {} kcal/mol (need <= {} in at least one)".format(
+                    seed_mfe_2_7, seed_mfe_8_13, seed_mfe_threshold
+                )
+            )
+
     # Step 8: All binding sites
     min_site_mfe = DEFAULT_MFE_THRESHOLD_PLANT if rule_set == "plant" else DEFAULT_MFE_THRESHOLD_ANIMAL
     all_sites = find_all_binding_sites(mirna_seq, target_seq, min_site_mfe) if len(target_seq) > mirna_len + 12 else []
@@ -548,6 +660,9 @@ def find_targets(mirna_id, mirna_seq, target_id, target_seq, compute_pvalue=Fals
         "Fail_Reasons":       reasons,
         "Alignment_Structure": structure,
         "alignment":          alignment,
+        # v3.0: Seed region MFE detayları (rule_seed_mfe aktifse dolu)
+        "Seed_MFE_2_7":       seed_mfe_2_7,
+        "Seed_MFE_8_13":      seed_mfe_8_13,
     }
 
 if __name__ == "__main__":
